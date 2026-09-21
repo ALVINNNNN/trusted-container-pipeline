@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
 concurrency:
   group: trusted-pipeline-${{ github.ref }}
   cancel-in-progress: false
