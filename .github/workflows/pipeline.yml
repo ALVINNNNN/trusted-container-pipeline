@@ -1,0 +1,151 @@
+name: Trusted Container Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trusted-pipeline-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  tests:
+    name: Policy tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Run fail-closed policy tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Demonstrate a synthetic critical finding being blocked
+        run: python3 scripts/policy-demo.py
+      - name: Check shell syntax
+        run: for script in scripts/*.sh; do bash -n "$script"; done
+
+  release:
+    name: Sign, verify and demonstrate
+    needs: tests
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    env:
+      IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/pipeline.yml@refs/heads/main
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Prepare evidence and image name
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          mkdir -p evidence
+          echo "IMAGE=ghcr.io/${REPOSITORY,,}" >> "$GITHUB_ENV"
+          echo "TAG=run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
+          printf '%s\n' "$GITHUB_SHA" > evidence/source-commit.txt
+      - name: Install checksum-pinned tools
+        run: bash scripts/install-tools.sh 2>&1 | tee evidence/tool-versions.log
+      - name: Log in to GitHub Container Registry
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Build and push candidate (not yet approved)
+        run: |
+          docker build --pull --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "demo.run=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" -t "$IMAGE:$TAG" .
+          docker push "$IMAGE:$TAG"
+          docker pull "$IMAGE:$TAG"
+          REF=$(docker image inspect "$IMAGE:$TAG" --format '{{index .RepoDigests 0}}')
+          echo "REF=$REF" >> "$GITHUB_ENV"
+          printf '%s\n' "$REF" > evidence/image.txt
+      - name: Prove unsigned candidate is rejected
+        run: |
+          bash scripts/expect-rejection.sh unsigned 'no signatures|no matching signatures|no valid signatures|no signature found' \
+            bash scripts/verify-image.sh "$REF" "$IDENTITY"
+      - name: Scan the exact digest and generate SBOM
+        run: |
+          trivy image --scanners vuln --format json --output evidence/scan.json "$REF"
+          trivy image --format cyclonedx --output evidence/sbom.cdx.json "$REF"
+      - name: Enforce vulnerability policy before signing
+        run: python3 scripts/gate.py evidence/scan.json --image "$REF" --output evidence/build-decision.json
+      - name: Sign the approved digest and attest its SBOM
+        run: |
+          cosign sign --yes "$REF"
+          cosign attest --yes --type cyclonedx --predicate evidence/sbom.cdx.json "$REF"
+      - name: Verify signature and SBOM attestation
+        run: |
+          bash scripts/verify-image.sh "$REF" "$IDENTITY" > evidence/signature-verification.json
+          cosign verify-attestation --type cyclonedx \
+            --certificate-identity "$IDENTITY" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$REF" > evidence/attestation-verification.json
+          echo 'PASS: trusted signature and SBOM attestation verified' | tee -a evidence/scenarios.txt
+      - name: Prove an unexpected signing identity is rejected
+        run: |
+          bash scripts/expect-rejection.sh wrong-identity 'identity|identities|subject alternative|certificate.*match' \
+            bash scripts/verify-image.sh "$REF" \
+            "https://github.com/$GITHUB_REPOSITORY/.github/workflows/untrusted.yml@refs/heads/main"
+      - name: Build a modified image and prove rejection
+        run: |
+          # Benign added file changes the image digest. No exploit payload is used.
+          mkdir -p "$RUNNER_TEMP/modified"
+          printf 'FROM %s\nCOPY marker.txt /tamper-demo.txt\n' "$REF" > "$RUNNER_TEMP/modified/Dockerfile"
+          printf 'Benign modified-image demonstration\n' > "$RUNNER_TEMP/modified/marker.txt"
+          docker build -t "$IMAGE:modified-$TAG" "$RUNNER_TEMP/modified"
+          docker push "$IMAGE:modified-$TAG"
+          docker pull "$IMAGE:modified-$TAG"
+          MODIFIED=$(docker image inspect "$IMAGE:modified-$TAG" --format '{{index .RepoDigests 0}}')
+          test "$MODIFIED" != "$REF"
+          printf '%s\n' "$MODIFIED" > evidence/modified-image.txt
+          bash scripts/expect-rejection.sh modified-image 'no signatures|no matching signatures|no valid signatures|no signature found' \
+            bash scripts/verify-image.sh "$MODIFIED" "$IDENTITY"
+      - name: Demonstrate vulnerability policy rejection
+        run: python3 scripts/policy-demo.py | tee -a evidence/scenarios.txt
+      - name: Rescan before deployment and enforce policy again
+        run: |
+          trivy image --scanners vuln --format json --output evidence/pre-deploy-scan.json "$REF"
+          python3 scripts/gate.py evidence/pre-deploy-scan.json --image "$REF" --output evidence/deploy-decision.json
+      - name: Deploy verified digest to disposable runner and check health
+        run: bash scripts/smoke-test.sh "$REF" "$IDENTITY"
+      - name: Publish run summary
+        if: always()
+        env:
+          RESULT: ${{ job.status }}
+        run: |
+          {
+            echo '## Trusted Container Pipeline'
+            echo "Job result: $RESULT"
+            echo ''
+            echo "Source commit: $GITHUB_SHA"
+            echo ''
+            echo '### Completed checks'
+            cat evidence/scenarios.txt 2>/dev/null || echo 'No scenarios completed.'
+            echo ''
+            echo '### Vulnerability decision'
+            echo '```json'
+            cat evidence/build-decision.json 2>/dev/null || echo '{"decision":"NOT_REACHED"}'
+            echo '```'
+            echo 'Download the security-evidence artifact for exact digests, scan results, SBOM and verification logs.'
+            echo 'The Critical policy fixture is synthetic; all image signature checks use real Cosign verification.'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: security-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/
+          retention-days: 14
+          if-no-files-found: warn
+      - name: Log out of registry
+        if: always()
+        run: docker logout ghcr.io

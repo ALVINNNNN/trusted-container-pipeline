@@ -1,0 +1,4 @@
+{
+  "block_severities": ["CRITICAL"],
+  "description": "Learning baseline: block all CRITICAL findings, including those without a fix. HIGH and lower remain visible."
+}
