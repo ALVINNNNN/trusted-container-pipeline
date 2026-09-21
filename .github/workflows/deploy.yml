@@ -1,0 +1,111 @@
+name: Deploy Verified Release
+
+on:
+  workflow_run:
+    workflows: [Trusted Container Pipeline]
+    branches: [main]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Successful main build run ID to verify and deploy
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+  packages: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: trusted-deploy-${{ github.event.workflow_run.id || inputs.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Independently verify and enforce Kubernetes admission
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_repository.full_name == github.repository &&
+       (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      UPSTREAM_RUN_ID: ${{ github.event.workflow_run.id || inputs.run_id }}
+      IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/pipeline.yml@refs/heads/main
+    steps:
+      - name: Check out trusted deployment code from main, never from an artifact
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Read authenticated upstream run metadata
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          [[ "$UPSTREAM_RUN_ID" =~ ^[0-9]+$ ]]
+          mkdir -p evidence
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$UPSTREAM_RUN_ID" > evidence/upstream-run.json
+      - name: Download only the release metadata from that run
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: release-handoff
+          path: handoff
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ env.UPSTREAM_RUN_ID }}
+      - name: Validate untrusted metadata against GitHub run and image allowlist
+        run: python3 scripts/validate-handoff.py
+      - name: Install checksum-pinned verification tools
+        run: bash scripts/install-tools.sh 2>&1 | tee evidence/tool-versions.log
+      - name: Log in to GHCR with temporary read-only token
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Verify signed provenance, SBOM and scan; rescan exact digest
+        run: bash scripts/verify-release.sh 2>&1 | tee evidence/release-verification.log
+      - name: Prove the wrong workflow identity is rejected
+        run: |
+          bash scripts/expect-rejection.sh wrong-identity 'identity|identities|subject alternative|certificate.*match' \
+            bash scripts/verify-image.sh "$REF" \
+            "https://github.com/$GITHUB_REPOSITORY/.github/workflows/untrusted.yml@refs/heads/main"
+      - name: Create disposable Kubernetes cluster and install enforcing policy
+        run: bash scripts/install-cluster.sh 2>&1 | tee evidence/cluster-setup.log
+      - name: Exercise real admission rejection and approved deployment
+        run: python3 scripts/admission-demo.py 2>&1 | tee evidence/admission-results.log
+      - name: Gather non-secret diagnostics
+        if: always()
+        run: |
+          kubectl -n trusted-demo get pods -o wide > evidence/pods.txt 2>&1 || true
+          kubectl -n kyverno get pods -o wide > evidence/controllers.txt 2>&1 || true
+          kubectl get clusterpolicy trusted-release -o json > evidence/applied-policy.json 2>/dev/null || true
+          kubectl -n kyverno logs deployment/kyverno-admission-controller --tail=120 > evidence/admission-controller.log 2>&1 || true
+      - name: Deployment summary
+        if: always()
+        env:
+          RESULT: ${{ job.status }}
+        run: |
+          {
+            echo '## Independent verification and Kubernetes admission'
+            echo "Job result: $RESULT"
+            echo "Upstream build: https://github.com/$GITHUB_REPOSITORY/actions/runs/$UPSTREAM_RUN_ID"
+            echo '```text'
+            cat evidence/admission-results.log 2>/dev/null || echo 'Admission demo not reached.'
+            echo '```'
+            echo 'The signed Critical fixture is synthetic; signature, provenance and webhook enforcement are real.'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: deployment-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/
+          retention-days: 14
+      - name: Remove disposable cluster and temporary registry credentials
+        if: always()
+        run: |
+          if [[ -x .tools/kind ]]; then .tools/kind delete cluster --name trusted-demo; fi
+          docker logout ghcr.io

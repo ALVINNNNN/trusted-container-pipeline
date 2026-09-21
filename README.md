@@ -1,95 +1,99 @@
 # Trusted Container Pipeline
 
-[![Trusted Container Pipeline](https://github.com/ALVINNNNN/trusted-container-pipeline/actions/workflows/pipeline.yml/badge.svg)](https://github.com/ALVINNNNN/trusted-container-pipeline/actions/workflows/pipeline.yml)
+[![Build](https://github.com/ALVINNNNN/trusted-container-pipeline/actions/workflows/pipeline.yml/badge.svg)](https://github.com/ALVINNNNN/trusted-container-pipeline/actions/workflows/pipeline.yml)
+[![Deploy and admission](https://github.com/ALVINNNNN/trusted-container-pipeline/actions/workflows/deploy.yml/badge.svg)](https://github.com/ALVINNNNN/trusted-container-pipeline/actions/workflows/deploy.yml)
 
-**Can I prove where a container came from before I run it?**
+**Prove what was built, who signed it, and whether Kubernetes should allow it to run.**
 
-A hands-on DevSecOps project that builds a small Python API, scans its image,
-generates an SBOM, signs the approved image with GitHub Actions identity, and
-verifies it before deployment to a disposable runner.
+A hands-on DevSecOps project with two independent workflows. Build signs an image
+and its evidence. Deployment verifies that evidence, rescans the image, and asks
+Kubernetes to admit it under an enforcing Kyverno policy.
 
-The interesting part is testing the failures: an unsigned image, the wrong
-signing identity, a modified image, and a vulnerability policy violation.
-
-## Pipeline
+## Architecture
 
 ```mermaid
 flowchart TD
-    A[Build and push candidate] --> B[Scan exact digest and generate SBOM]
-    B --> C{Vulnerability policy}
-    C -->|Block or error| X[Stop release]
-    C -->|Allow| D[Sign image and attest SBOM]
-    D --> E{Verify trusted identity and digest}
-    E -->|Reject or error| X
-    E -->|Accept| F[Rescan and apply policy]
-    F --> G[Verify again and run health check]
+    A[Pinned base and source commit] --> B[Build and scan exact image digest]
+    B --> C[Sign image, SBOM, provenance and scan decision]
+    C --> D[Separate deployment workflow]
+    D --> E[Verify source, run, base and policy; rescan]
+    E --> F{Kubernetes admission policy}
+    F -->|Trusted and compliant| G[Run Pod and check health]
+    F -->|Missing or failing evidence| H[Reject Pod]
 ```
 
-The candidate is pushed to GHCR so it can be signed and verified by digest.
-**Registry presence does not mean release approval.** Only the gated path runs it.
+## Implemented controls
 
-## What it demonstrates
-
-| Scenario | Test and expected result |
+| Control | Implementation |
 |---|---|
-| Trusted image | Real Cosign signature and signed CycloneDX attestation verified; API health check passes |
-| Unsigned image | Candidate is checked before signing and rejected |
-| Wrong identity | Signed image checked against an untrusted workflow identity and rejected |
-| Modified image | A benign extra file changes the image digest; the new unsigned image is rejected |
-| Critical vulnerability | Explicitly synthetic scan fixture is blocked, including when no fixed version exists |
-| Invalid evidence | Unit tests reject missing results, wrong image, malformed report and mutable tags |
+| Pinned base | Docker Hub Python base uses a verified immutable multi-platform index digest |
+| Signed provenance | SLSA v1-format predicate records source commit, base digest, platform, builder and run ID/attempt |
+| Separate deployment | `deploy.yml` has package-read and Actions-read permissions; no package-write or OIDC signing permission |
+| Safe handoff | Download only JSON metadata from a successful same-repository main build; validate it against authenticated GitHub run metadata |
+| Independent checks | Verify signatures and signed predicates, require a scan <= 24 hours old, then rescan the exact digest |
+| Admission enforcement | Kyverno checks signatures, signed SBOM, provenance and scan policy before the Pod is admitted |
+| Shared policy | Both CI and admission derive blocked severity counts from `policy/release.json` |
+| Runtime restrictions | Non-root Pod, no service-account token, read-only filesystem, dropped capabilities and resource limits |
 
-Negative signature tests also check the error message. An unrelated network or
-registry error must not count as proof that a security control worked.
+No manually created PAT, signing secret, cloud account or persistent cluster is
+required. GHCR credentials are temporary job tokens. GitHub usage is subject to
+the account's Actions/package quotas.
 
-## Run it
+## Real rejection demos
 
-1. Open **Actions → Trusted Container Pipeline → Run workflow → main**.
-2. Watch **Policy tests**, then **Sign, verify and demonstrate**.
-3. Open the run summary and download `security-evidence-<run>-<attempt>`.
-
-A push to `main` also runs the complete pipeline. Pull requests run only local
-tests with read-only repository permissions; they cannot publish or sign images.
-
-No manually created PAT, cloud account, or signing secret is required. The release
-job uses the temporary `GITHUB_TOKEN` for GHCR and GitHub OIDC for keyless signing.
-GitHub Actions and package usage remain subject to the account's quotas.
-
-If GHCR denies the push, check that organization/repository policies permit
-package publishing and that this repository has write access to an existing
-package with the same name. Do not add a broad PAT to work around it.
-
-## Evidence to inspect
-
-| Artifact file | What it tells you |
+| Case | Expected result |
 |---|---|
-| `image.txt`, `source-commit.txt` | Exact released digest and source commit |
-| `scan.json`, `pre-deploy-scan.json` | Actual Trivy results for that digest |
-| `build-decision.json`, `deploy-decision.json` | Policy verdict, severity counts and blocking findings |
-| `sbom.cdx.json` | CycloneDX software inventory |
-| `signature-verification.json` | Cosign verification of the approved digest and workflow identity |
-| `attestation-verification.json` | Verified signed SBOM statement |
-| `unsigned.log`, `wrong-identity.log`, `modified-image.log` | Actual rejection output |
-| `synthetic-policy.log` | Clearly labeled synthetic Critical-policy demonstration |
-| `health.json`, `scenarios.txt` | Health response and checks that actually completed |
+| Approved image and complete compliant evidence | Pod admitted, Ready and `/health` returns `{"status":"ok"}` |
+| Unsigned/modified image | Rejected by the signature rule |
+| Signed image with SBOM and scan but no provenance | Rejected by the provenance rule |
+| Signed image with a failing scan fixture | Rejected by the scan rule |
+| Signed image referenced by a mutable tag | Rejected because the digest is required |
+| Approved application with an unsigned init container | Rejected by signature verification |
+| Wrong expected workflow identity | Rejected by the deployment's Cosign verification test |
 
-Artifacts are retained for 14 days. Download evidence before it expires.
-No static README claim substitutes for a successful workflow run.
+The failing scan fixture is explicitly **synthetic**, not a real CVE finding.
+Its image, signature and admission request are real. Negative admission tests use
+server-side dry runs, so rejected images never execute. A generic infrastructure
+failure is not counted as a successful rejection test.
 
-## Policy
+## Run and inspect
 
-`policy/release.json` blocks **all CRITICAL findings**, with or without a fix.
-HIGH, MEDIUM, LOW and UNKNOWN findings remain visible but do not block this
-learning baseline. This is not a claim that an allowed image is vulnerability-free.
+1. Open **Actions → Trusted Container Pipeline → Run workflow → main** (or push to main).
+2. After the build succeeds, **Deploy Verified Release** starts automatically.
+3. Open both run summaries and download their evidence artifacts.
+4. For deployment-only retries, run **Deploy Verified Release** manually with the
+   successful build run ID. Old builds are rejected if their evidence is stale or
+   no longer matches the reviewed base/policy.
 
-For a stricter policy, change `block_severities` to `["HIGH", "CRITICAL"]` and run
-again. If a real scan blocks a release, inspect the CVE, package and fixed version
-in the decision file; update the affected dependency/base image and rebuild.
-Do not change the threshold simply to make the badge green.
+Pull requests run unit tests only and cannot publish or sign images. The deployment
+workflow never checks out a PR head or executes files from downloaded artifacts.
 
-## Try locally
+## Evidence
 
-With Python 3.10+:
+| Build evidence | Deployment evidence |
+|---|---|
+| Actual Trivy scan and policy decision | Verified signature and decoded-validation results |
+| CycloneDX SBOM | Verified signed SBOM, provenance and scan envelopes |
+| Signed provenance/scan predicates | Authenticated upstream run metadata |
+| Approved and fixture image digests | Fresh Trivy scan and deployment decision |
+| Build log and source commit | Rendered/applied Kyverno policy and rejection logs |
+| JSON release handoff | Pod readiness and Kubernetes API health response |
+
+Artifacts are retained for 14 days. A green build badge alone does not prove
+admission succeeded: check the separate deployment badge and its actual logs.
+
+## Vulnerability policy
+
+The baseline blocks **all CRITICAL findings**, including those without a fix.
+HIGH, MEDIUM, LOW and UNKNOWN remain visible but do not block. This is a learning
+policy, not a claim that an allowed image is vulnerability-free.
+
+Change `block_severities` to `["HIGH", "CRITICAL"]` for a stricter policy. Admission
+is generated from the same file, so it tightens with CI. Remediate blocked findings
+by updating the affected package/base image and rebuilding; do not lower the
+threshold simply to make the badge green.
+
+## Local learning
 
 ```bash
 python3 -m unittest discover -s tests -v
@@ -99,54 +103,39 @@ python3 app/server.py
 curl http://127.0.0.1:8080/health
 ```
 
-With Docker:
+The API uses Python's standard-library HTTP server for demonstration, not production.
+Use GitHub Actions for keyless signing and the complete Kubernetes exercise.
 
-```bash
-docker build -t trusted-container-demo .
-docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges \
-  -p 127.0.0.1:8080:8080 trusted-container-demo
-```
+- [Learning exercises](docs/LEARNING.md)
+- [Build provenance definition](docs/BUILD-TYPE.md)
+- [Kubernetes policy, scope and limits](kubernetes/README.md)
 
-The local Docker command is an application smoke test; it does not provide the
-GitHub keyless signing flow. Use Actions for the complete security demonstration.
+## Trust boundaries
 
-## Security choices and limits
+The base pin prevents silent tag changes; it does not make the entire build
+hermetic or bit-reproducible. Dependabot can propose Docker base updates. Review
+new pins and tool release checksums before accepting them.
 
-- Sign and deploy by immutable SHA-256 digest, not a mutable tag.
-- Match the exact workflow URL and `refs/heads/main` certificate identity, plus
-  the GitHub Actions OIDC issuer. Keep transparency-log checks enabled.
-- Pin third-party Actions by commit and tool downloads by SHA-256. Tool hashes
-  are a reviewed upstream-release trust bootstrap, not independent provenance.
-- Verify the signed SBOM, then scan the exact image again before deployment.
-- Run as a non-root user with a read-only filesystem and dropped capabilities.
-- The Python standard-library HTTP server is a demo, not a production server.
-- The base image tag is intentionally refreshed by `--pull`; the resulting image
-  is pinned at release time. For reproducible builds, pin the base-image digest
-  and maintain an explicit update process.
-- Repository writers can change the workflow and policy. Main-branch protection,
-  required review, protected environments, and an independently managed admission
-  policy are needed for stronger separation of duties; this project does not
-  configure those account controls.
-- A valid signature establishes the signer and content integrity, not safe code.
-  A signed SBOM is an inventory statement, not a full SLSA provenance attestation.
-- The modified-image demo creates a different unsigned digest; it does not forge
-  or mutate a valid signature. Wrong-identity testing uses the genuine signature
-  against a deliberately incorrect allowlisted identity.
-- GitHub, GHCR, Sigstore services, runner integrity, scanner databases and the
-  tool publishers remain part of the trust boundary.
+Provenance is generated inside the build workflow and signed by that workflow.
+It is not independent proof of SLSA Level 3. A compromised authorized builder can
+still sign bad software. The deployment workflow is separate, but both workflows
+and the policy remain in the same repository; protect main and use independent
+policy ownership for stronger separation of duties.
 
-## Learn and extend
+The kind cluster and Kyverno policy are temporary. Policy applies to Pods in
+`trusted-demo`, not every namespace. The demo job is a cluster administrator;
+production deployers must not be allowed to change admission controls. A long-lived
+cluster also needs scan-freshness and verification-cache policies. Running Pods
+are not continuously rescanned by this project.
 
-See [the learning guide](docs/LEARNING.md) for exercises, expected observations,
-troubleshooting, and a short demo outline.
-
-Next steps: pin the base digest, add signed build provenance, move verification
-into a separate deployment workflow, then enforce the same policy through a
-Kubernetes admission controller.
+Actions are commit-pinned, downloaded tools/install manifests are checksum-pinned,
+and the kind node image is digest-pinned. The upstream Kyverno installer contains
+versioned controller image tags. GitHub, registries, runner images, trusted tool
+publishers and Sigstore services remain dependencies.
 
 ## References
 
-- [Sigstore keyless signing](https://docs.sigstore.dev/quickstart/quickstart-cosign/)
 - [Cosign verification](https://docs.sigstore.dev/cosign/verifying/verify/)
+- [SLSA provenance](https://slsa.dev/spec/v1.2/provenance)
+- [Kyverno signatures and attestations](https://kyverno.io/docs/policy-types/cluster-policy/verify-images/sigstore/)
 - [Trivy documentation](https://trivy.dev/docs/)
-- [GitHub artifact attestations](https://docs.github.com/en/actions/concepts/security/artifact-attestations)

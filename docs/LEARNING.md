@@ -1,82 +1,102 @@
 # Learning guide
 
-## 1. Understand the image identity
+## 1. Pinning and image identity
 
-Open `evidence/image.txt` from a successful workflow artifact. The part after
-`@sha256:` identifies the image content. A tag is a name that can be moved;
-the digest changes when the content changes.
+Read the first line of `Dockerfile`. The human-readable Python tag is followed
+by an immutable digest. Docker Hub supplies the pinned base; the workflow adds
+this repository's API and publishes a different image digest to GHCR.
 
-Compare `modified-image.txt` with `image.txt`. The modified demo adds only a
-harmless marker file, yet the original signature cannot approve the new digest.
+Compare the approved and unsigned fixture image digests in build evidence. A
+benign marker file changes the output digest, so the approved image's signature
+cannot authorize the changed image.
 
-## 2. Understand the signer
+Exercise: propose a base-digest update through a PR. Explain why a tag-only update
+cannot change a digest-pinned build and why the new pin needs another scan.
 
-The expected signer is:
+## 2. Signing identity
 
-```
-https://github.com/ALVINNNNN/trusted-container-pipeline/.github/workflows/pipeline.yml@refs/heads/main
-```
+The trusted signer is this repository's `pipeline.yml` workflow on `main`, with
+GitHub Actions as the OIDC issuer. Cosign creates short-lived signing credentials;
+there is no long-lived signing key in repository secrets.
 
-GitHub gives the job a short-lived OIDC identity. Cosign obtains a signing
-certificate through Sigstore and signs the image. The verifier checks the
-signature, image digest, exact certificate identity, issuer and transparency
-evidence. No long-lived signing key is stored in this repo.
+The deployment workflow can read packages and verify evidence but cannot request
+an OIDC signing token or publish signatures. Find these permission differences
+in the two workflow files.
 
-Open `wrong-identity.log`: why should a cryptographically valid signature still
-be rejected? Because the signer must also match the release's trust policy.
+## 3. SBOM versus provenance versus scan
 
-## 3. Understand the SBOM
+- SBOM: what software is inside the image?
+- Provenance: which source, base and workflow invocation produced the image?
+- Scan decision: what did the vulnerability policy conclude about that digest?
 
-Open `sbom.cdx.json`. Find the Python version and several operating-system
-packages. The SBOM answers what is inside the image. The scan adds vulnerability
-intelligence. The signed attestation binds the inventory statement to an image
-digest and signer. None of these alone proves the application is secure.
+All three are signed statements bound to the image digest. Inspect their JSON
+predicates in build evidence and the verified envelopes in deployment evidence.
+They answer different questions and none proves that the application is safe.
 
-## 4. Change a policy deliberately
+## 4. Follow the deployment trust checks
 
-Create a branch, add HIGH to `block_severities`, and open a PR. Read the unit-test
-results, then review and merge the policy if appropriate. Main runs the live
-scan. Compare the decision counts with the individual Trivy records.
+Read `validate-handoff.py`, `verify-release.sh` and `evidence.py` in that order.
+The artifact handoff is only a pointer, not an authorization decision. The deployer
+checks the upstream run through GitHub's authenticated API, accepts only digest
+references in its own image repository, then verifies signed claims before running
+any image. A valid signature from the wrong workflow identity is rejected.
 
-The deterministic fixture uses `DEMO-CRITICAL-001`, not a real CVE. It proves that
-the gate handles a Critical record. Real vulnerability findings are exclusively
-in the actual scan reports. Never present the synthetic fixture as an exploited
-vulnerability or as evidence of a vulnerable production service.
+Exercise: use the unit tests to see why a different commit, base, run attempt,
+image digest, policy hash or stale scan is rejected.
 
-## 5. Practice fail-closed behavior
+## 5. Change the severity policy
 
-Run the unit tests locally. They verify that missing results, malformed fields,
-an unexpected image and mutable tags do not pass. Delete `Results` from a copy
-of a real scan and run `scripts/gate.py`: it should return ERROR (exit code 2),
-not ALLOW. Policy violations use exit code 1; successful evaluation uses 0.
+The baseline blocks Critical findings. Change `policy/release.json` to also block
+High through a reviewed PR, then build again. Read the actual scan and remediate
+any blocked packages. `render_admission.py` uses that same policy file to generate
+Kubernetes conditions, so there is no second severity list to forget to update.
 
-## 6. Read the trust boundary
+The signed Critical fixture is marked synthetic and must not be presented as a
+real discovered CVE. It tests whether the cluster rejects an authenticated but
+noncompliant statement.
 
-Could a repository writer remove the verification command? Yes. Could a
-compromised trusted workflow sign a malicious image? Yes. This demonstrates
-why protected branches and independently enforced deployment policies matter.
-The next iteration should put the trust policy outside the application's
-writable repository and require review for policy changes.
+## 6. Watch Kubernetes enforce the policy
+
+Open the deployment run's admission results and rejection logs. Observe:
+
+1. A complete compliant release creates a Ready Pod.
+2. An unsigned image is denied.
+3. A signed image missing only provenance is denied.
+4. A signed synthetic failing scan is denied under `trusted-scan`.
+5. A mutable image tag is denied.
+6. An unsigned init container prevents admission even when the main container is approved.
+
+Server-side dry runs reach the real admission webhook without starting rejected
+containers. The successful Pod and `/health` check show the cluster was functional.
+
+## 7. Explain the remaining limits
+
+Can repository writers change the build and deployment policies? Yes. Can the
+demo job edit cluster policy? Yes. Can a trusted compromised builder lie? Yes.
+This is why independent platform-owned admission policy, branch protection,
+required review and restricted production RBAC matter.
+
+The cluster is temporary and bound to one expected build run. Production needs
+ongoing scanning, freshness/cache handling and policies across all relevant
+namespaces. This project does not certify a SLSA level.
 
 ## Troubleshooting
 
-| Symptom | Next step |
+| Symptom | What to inspect |
 |---|---|
-| Package push denied | Check GHCR package/repository access and organization Actions policies |
-| Real Critical finding | Read package and fixed-version information, remediate and rebuild |
-| No fixed version | Assess risk and seek a safe alternate image/version; this baseline still blocks it |
-| Negative demo is INCONCLUSIVE | Inspect its log; registry/network/service failure is not a successful security test |
-| Signing or verification service unavailable | Keep the release blocked; retry after service recovery |
-| Tool checksum mismatch | Stop and investigate upstream release integrity; never bypass the checksum |
-| Identity mismatch on a fork | Workflow builds the expected identity from `github.repository`; verify the branch and workflow path |
+| Build blocks on a real vulnerability | Scan JSON, package and fixed-version fields; update and rebuild |
+| Handoff rejected | Upstream event, branch, repo, commit and run attempt |
+| Provenance rejected | Expected base pin, source commit, builder and run ID |
+| Old build rejected | Scan age or changed policy/base pin; make a fresh build |
+| GHCR access denied | Package access for this repository; no broad PAT is required |
+| Admission setup fails | Cluster setup log and Kyverno controller/pod diagnostics |
+| Negative test does not show a policy denial | Treat as inconclusive/failure, not a security success |
+| Checksum mismatch | Stop and investigate the upstream asset; never bypass the check |
 
-## A 90-second portfolio demonstration
+## Portfolio demo
 
-1. Explain the problem: scanning does not establish who built or signed an image.
-2. Show the workflow graph and exact image digest.
-3. Show the unsigned, wrong-identity and modified-image rejection logs.
-4. Show the signed SBOM verification and vulnerability decision.
-5. End with the verified deployment's health response and explain one limitation.
-
-Describe results only after the corresponding workflow steps succeed. Use the
-actual run URL and artifact logs when discussing the project on LinkedIn.
+Show both workflow runs. Open signed provenance, point to its source commit and
+base digest, then show the Kubernetes rejection logs and the approved Pod's health
+response. Explain that signing establishes identity and integrity while admission
+adds enforcement. Discuss one remaining trust boundary instead of claiming that
+the pipeline makes every signed image safe.
