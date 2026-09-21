@@ -6,6 +6,6 @@ if [[ ! "$image" =~ ^[^[:space:]@]+@sha256:[a-f0-9]{64}$ ]]; then
   echo 'BLOCK: an immutable SHA-256 image reference is required' >&2
   exit 2
 fi
-cosign verify "$image" \
+cosign verify --new-bundle-format=false "$image" \
   --certificate-identity "$identity" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com

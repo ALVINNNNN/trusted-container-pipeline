@@ -4,7 +4,7 @@ set -euo pipefail
 bash scripts/verify-image.sh "$REF" "$IDENTITY" > evidence/verified-signature.json
 for spec in 'provenance|https://slsa.dev/provenance/v1' 'scan|https://trusted-container-pipeline.dev/attestations/scan/v1' 'sbom|cyclonedx'; do
   name=${spec%%|*}; type=${spec#*|}
-  cosign verify-attestation --type "$type" --certificate-identity "$IDENTITY" \
+  cosign verify-attestation --new-bundle-format=false --type "$type" --certificate-identity "$IDENTITY" \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com "$REF" \
     > "evidence/verified-$name.jsonl"
 done
