@@ -16,10 +16,11 @@ trivy image --scanners vuln --format json --output evidence/scan.json "$REF"
 trivy image --format cyclonedx --output evidence/sbom.cdx.json "$REF"
 python3 scripts/gate.py evidence/scan.json --image "$REF" --output evidence/build-decision.json
 python3 scripts/evidence.py generate --image "$REF"
-cosign sign --new-bundle-format=false --yes "$REF"
-cosign attest --new-bundle-format=false --yes --type cyclonedx --predicate evidence/sbom.cdx.json "$REF"
-cosign attest --new-bundle-format=false --yes --type slsaprovenance1 --predicate evidence/provenance.json "$REF"
-cosign attest --new-bundle-format=false --yes --type https://trusted-container-pipeline.dev/attestations/scan/v1 \
+# Cosign v3 requires both flags for the legacy format consumed by Kyverno.
+cosign sign --new-bundle-format=false --use-signing-config=false --yes "$REF"
+cosign attest --new-bundle-format=false --use-signing-config=false --yes --type cyclonedx --predicate evidence/sbom.cdx.json "$REF"
+cosign attest --new-bundle-format=false --use-signing-config=false --yes --type slsaprovenance1 --predicate evidence/provenance.json "$REF"
+cosign attest --new-bundle-format=false --use-signing-config=false --yes --type https://trusted-container-pipeline.dev/attestations/scan/v1 \
   --predicate evidence/scan-predicate.json "$REF"
 
 # Separate benign fixture images are never promoted as approved releases.
@@ -34,9 +35,9 @@ for variant in unsigned missing-provenance blocked-scan; do
   variant_ref=$(docker image inspect "$IMAGE:$variant-$TAG" --format '{{index .RepoDigests 0}}')
   printf '%s\n' "$variant_ref" > "evidence/$variant-image.txt"
   if [[ "$variant" == unsigned ]]; then continue; fi
-  cosign sign --new-bundle-format=false --yes "$variant_ref"
+  cosign sign --new-bundle-format=false --use-signing-config=false --yes "$variant_ref"
   trivy image --format cyclonedx --output "evidence/$variant-sbom.json" "$variant_ref"
-  cosign attest --new-bundle-format=false --yes --type cyclonedx --predicate "evidence/$variant-sbom.json" "$variant_ref"
+  cosign attest --new-bundle-format=false --use-signing-config=false --yes --type cyclonedx --predicate "evidence/$variant-sbom.json" "$variant_ref"
   if [[ "$variant" == missing-provenance ]]; then
     trivy image --scanners vuln --format json --output evidence/missing-scan-report.json "$variant_ref"
     python3 scripts/gate.py evidence/missing-scan-report.json --image "$variant_ref" --output evidence/missing-decision.json
@@ -47,7 +48,7 @@ from scripts.evidence import scan_predicate
 d = json.loads(Path('evidence/missing-decision.json').read_text())
 Path('evidence/missing-scan.json').write_text(json.dumps(scan_predicate(d, os.environ['GITHUB_SHA'])))
 PY
-    cosign attest --new-bundle-format=false --yes --type https://trusted-container-pipeline.dev/attestations/scan/v1 \
+    cosign attest --new-bundle-format=false --use-signing-config=false --yes --type https://trusted-container-pipeline.dev/attestations/scan/v1 \
       --predicate evidence/missing-scan.json "$variant_ref"
   fi
   if [[ "$variant" == blocked-scan ]]; then
@@ -65,8 +66,8 @@ decision = {'image': Path('evidence/blocked-scan-image.txt').read_text().strip()
             'violations': [{'VulnerabilityID': 'DEMO-SYNTHETIC-CRITICAL', 'Severity': 'CRITICAL'}]}
 Path('evidence/blocked-scan.json').write_text(json.dumps(scan_predicate(decision, os.environ['GITHUB_SHA'], fixture=True)))
 PY
-    cosign attest --new-bundle-format=false --yes --type slsaprovenance1 --predicate evidence/blocked-provenance.json "$variant_ref"
-    cosign attest --new-bundle-format=false --yes --type https://trusted-container-pipeline.dev/attestations/scan/v1 \
+    cosign attest --new-bundle-format=false --use-signing-config=false --yes --type slsaprovenance1 --predicate evidence/blocked-provenance.json "$variant_ref"
+    cosign attest --new-bundle-format=false --use-signing-config=false --yes --type https://trusted-container-pipeline.dev/attestations/scan/v1 \
       --predicate evidence/blocked-scan.json "$variant_ref"
   fi
 done
