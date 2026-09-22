@@ -16,7 +16,7 @@ def policies(repo, commit, run_id, attempt):
         return {"key": "{{ " + key + " }}", "operator": "Equals", "value": value}
 
     def verification():
-        return {"imageReferences": ["*"], "failureAction": "Enforce", "required": True,
+        return {"type": "SigstoreBundle", "imageReferences": ["*"], "failureAction": "Enforce", "required": True,
                 "mutateDigest": False, "verifyDigest": True,
                 "imageRegistryCredentials": {"secrets": ["registry-read"]}}
 
