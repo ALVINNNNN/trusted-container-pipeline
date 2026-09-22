@@ -19,5 +19,19 @@ for ns in kyverno trusted-demo; do
     --from-file=.dockerconfigjson="$HOME/.docker/config.json"
 done
 python3 -m scripts.render_admission > evidence/admission-policy.json
-kubectl apply -f evidence/admission-policy.json
+# Deployment availability can precede webhook service connectivity.
+for attempt in {1..12}; do
+  if output=$(kubectl apply -f evidence/admission-policy.json 2>&1); then
+    printf '%s\n' "$output"
+    break
+  fi
+  printf '%s\n' "$output" >&2
+  if [[ "$output" != *'failed calling webhook'* ]] ||
+     [[ "$output" != *'connection refused'* && "$output" != *'no endpoints available'* ]] ||
+     (( attempt == 12 )); then
+    exit 1
+  fi
+  echo "Waiting for Kyverno webhook connectivity ($attempt/12)..."
+  sleep 5
+done
 kubectl wait --for=condition=Ready clusterpolicy/trusted-release --timeout=120s
