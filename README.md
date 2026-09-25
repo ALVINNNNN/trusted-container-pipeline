@@ -9,6 +9,23 @@ A hands-on DevSecOps project with two independent workflows. Build signs an imag
 and its evidence. Deployment verifies that evidence, rescans the image, and asks
 Kubernetes to admit it under an enforcing Kyverno policy.
 
+## Verified end-to-end result
+
+Both workflows passed for commit [`7591563`](https://github.com/ALVINNNNN/trusted-container-pipeline/commit/759156308521f253e6dd5e80ccaa3915224796ec):
+
+| Workflow | Result |
+|---|---|
+| [Build and signed evidence](https://github.com/ALVINNNNN/trusted-container-pipeline/actions/runs/35671476346) | Passed |
+| [Independent verification and Kubernetes admission](https://github.com/ALVINNNNN/trusted-container-pipeline/actions/runs/35671608889) | Passed |
+
+The approved Pod became Ready and returned a healthy API response. Kubernetes
+rejected all five negative cases: an unsigned image, missing provenance, a signed
+failing-scan fixture, a mutable image tag and an unsigned init container. The
+separate Cosign check also rejected the wrong workflow identity.
+
+These links record a verified run of that commit; the badges above show workflow
+status for subsequent runs.
+
 ## Architecture
 
 ```mermaid
@@ -44,7 +61,7 @@ the account's Actions/package quotas.
 | Case | Expected result |
 |---|---|
 | Approved image and complete compliant evidence | Pod admitted, Ready and `/health` returns `{"status":"ok"}` |
-| Unsigned/modified image | Rejected by the signature rule |
+| Separate unsigned fixture image | Rejected by the signature rule |
 | Signed image with SBOM and scan but no provenance | Rejected by the provenance rule |
 | Signed image with a failing scan fixture | Rejected by the scan rule |
 | Signed image referenced by a mutable tag | Rejected because the digest is required |
@@ -67,6 +84,28 @@ failure is not counted as a successful rejection test.
 
 Pull requests run unit tests only and cannot publish or sign images. The deployment
 workflow never checks out a PR head or executes files from downloaded artifacts.
+
+## Cosign and Kyverno compatibility
+
+The working setup uses Cosign v3.1.3 and Kyverno v1.19.1 with matching
+**Sigstore bundle** settings:
+
+| Component | Setting |
+|---|---|
+| `cosign sign` and `cosign attest` in `scripts/build-release.sh` | `--new-bundle-format=true --use-signing-config=true` |
+| `cosign verify` and `cosign verify-attestation` in the verification scripts | `--new-bundle-format=true` |
+| Every image-verification rule in `scripts/render_admission.py` | `type: SigstoreBundle` |
+
+The earlier legacy-format workaround (`--new-bundle-format=false`) is superseded.
+It first conflicted with Cosign v3's default signing configuration. Disabling that
+configuration allowed signing, but Kyverno's legacy verifier then failed
+certificate-chain validation. Matching modern bundles with `SigstoreBundle`
+verification resolved the end-to-end failure.
+
+Cluster setup also retries policy application up to 12 times, with five seconds
+between attempts, only when the Kyverno webhook reports a refused connection or
+missing endpoints during startup. Other errors fail immediately. Admission stays
+in enforcing mode with `failurePolicy: Fail`.
 
 ## Evidence
 
